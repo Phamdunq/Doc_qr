@@ -1,326 +1,760 @@
-import cv2
-import os
-import shutil
+# qr_decoder.py
+# ============================================================
+# QR DECODER V3 - CCCD / ID PHOTO
+# ============================================================
+#
+# Muc tieu:
+# - Doc QR tu anh CCCD chup bang dien thoai
+# - Ho tro anh toi, mo, nghieng, nho, co nen phuc tap
+# - Tu tao nhieu vung nghi ngo QR
+# - Xu ly sang/toi, CLAHE, denoise, sharpen, threshold
+# - Thu nhieu goc xoay
+# - ZXing-C++ la decoder chinh
+# - Ho tro them WeChatQRCode neu may da co model
+#
+# Cai dat toi thieu:
+#   py -m pip install opencv-python numpy zxing-cpp
+#
+# Khuyen nghi neu muon dung them WeChatQRCode:
+#   py -m pip install opencv-contrib-python
+#
+# Cach chay:
+#   py qr_decoder.py "D:\CCCD\001.jpg"
+#
+# Ket qua:
+#   STATUS | SUCCESS
+#   QR_DATA | ...
+#
+# ============================================================
+
+import sys
 from pathlib import Path
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from typing import List, Tuple, Optional
 
-# ============================================================
-# CHƯƠNG TRÌNH ĐỌC QR CCCD TỪ NHIỀU ẢNH
-#
-# Cấu trúc thư mục:
-#   chuong_trinh_doc_qr/
-#       doc_qr_cccd.py
-#       anh_cccd/                 <- bỏ ảnh vào đây
-#       anh_khong_doc_duoc_qr/    <- ảnh không đọc được sẽ được copy vào đây
-#
-# Kết quả:
-#   ket_qua_qr_cccd.xlsx
-# ============================================================
+import cv2
+import numpy as np
 
-BASE_DIR = Path(__file__).resolve().parent
-INPUT_DIR = BASE_DIR / "anh_cccd"
-FAILED_DIR = BASE_DIR / "anh_khong_doc_duoc_qr"
-OUTPUT_XLSX = BASE_DIR / "ket_qua_qr_cccd.xlsx"
-
-IMAGE_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"
-}
-
-def parse_cccd_qr(data: str):
-    """
-    QR CCCD thường có dạng:
-    CCCD||Họ tên|Ngày sinh|Giới tính|Địa chỉ|Ngày cấp
-
-    Trả về 6 trường chính.
-    Nếu định dạng khác, vẫn giữ toàn bộ dữ liệu ở cột QR_Goc.
-    """
-    data = data.strip().replace("\x00", "")
-
-    parts = data.split("|")
-
-    # Một số QR CCCD có || sau số CCCD.
-    if len(parts) >= 7 and parts[1] == "":
-        cccd = parts[0]
-        ho_ten = parts[2]
-        ngay_sinh = parts[3]
-        gioi_tinh = parts[4]
-        dia_chi = parts[5]
-        ngay_cap = parts[6]
-        return cccd, ho_ten, ngay_sinh, gioi_tinh, dia_chi, ngay_cap
-
-    # Trường hợp dữ liệu dùng đúng 6 phần.
-    if len(parts) >= 6:
-        return (
-            parts[0], parts[1], parts[2],
-            parts[3], parts[4], parts[5]
-        )
-
-    return "", "", "", "", "", ""
+try:
+    import zxingcpp
+except ImportError:
+    zxingcpp = None
 
 
-def decode_once(detector, image):
-    """Thử đọc QR trực tiếp từ một ảnh."""
+# ------------------------------------------------------------
+# CẤU HÌNH
+# ------------------------------------------------------------
+
+# Tạo ảnh debug khi không đọc được.
+# True = lưu các crop tốt nhất vào thư mục debug_qr
+SAVE_DEBUG = True
+
+# Số lượng candidate tối đa đem đi decode.
+MAX_CANDIDATES = 100
+
+# Các tỉ lệ crop phía trên bên phải của ảnh.
+# Dùng cho trường hợp ảnh CCCD giống ảnh mẫu.
+TOP_RIGHT_CROPS = [
+    (0.52, 0.18, 0.98, 0.58),
+    (0.58, 0.20, 0.96, 0.52),
+    (0.62, 0.22, 0.94, 0.48),
+    (0.48, 0.12, 0.99, 0.65),
+]
+
+
+# ------------------------------------------------------------
+# ĐỌC ẢNH
+# ------------------------------------------------------------
+
+def load_image(path: Path) -> Optional[np.ndarray]:
     try:
-        data, points, _ = detector.detectAndDecode(image)
-        if data:
-            return data
+        raw = np.fromfile(str(path), dtype=np.uint8)
+        return cv2.imdecode(raw, cv2.IMREAD_COLOR)
     except Exception:
-        pass
-    return None
+        return None
 
 
-def decode_qr_robust(image):
+# ------------------------------------------------------------
+# CHUẨN HÓA ẢNH
+# ------------------------------------------------------------
+
+def resize_for_processing(img: np.ndarray) -> np.ndarray:
     """
-    Đọc QR qua nhiều phiên bản ảnh để tăng khả năng đọc:
-    - ảnh gốc
-    - ảnh xám
-    - tăng tương phản
-    - threshold OTSU
-    - threshold adaptive
-    - làm nét
-    - phóng to / thu nhỏ
-    - xoay 90/180/270 độ
-
-    Không phụ thuộc vào kích thước ảnh.
+    Giữ ảnh đủ chi tiết nhưng tránh ảnh quá lớn làm chậm chương trình.
     """
-    detector = cv2.QRCodeDetector()
+    h, w = img.shape[:2]
+    longest = max(h, w)
 
-    h, w = image.shape[:2]
-
-    # Giới hạn kích thước để tránh xử lý ảnh quá lớn.
-    # Ảnh nhỏ sẽ được phóng lên; ảnh lớn sẽ được thu xuống.
-    scales = [1.0]
-
-    if min(h, w) < 1000:
-        scales.extend([1.5, 2.0, 3.0])
-    elif max(h, w) > 2500:
-        scales.extend([0.75, 0.5])
-
-    candidates = []
-
-    for scale in scales:
-        if scale == 1.0:
-            img = image
-        else:
-            img = cv2.resize(
-                image, None, fx=scale, fy=scale,
-                interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
-            )
-
-        candidates.append(img)
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        candidates.append(gray)
-
-        # Tăng tương phản cục bộ.
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        candidates.append(enhanced)
-
-        # OTSU.
-        _, otsu = cv2.threshold(
-            enhanced, 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    # Nếu ảnh quá lớn, giảm về khoảng 3000 px.
+    if longest > 3200:
+        scale = 3200.0 / longest
+        img = cv2.resize(
+            img,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
         )
-        candidates.append(otsu)
 
-        # Adaptive threshold.
-        adaptive = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31, 7
-        )
-        candidates.append(adaptive)
-
-        # Làm nét nhẹ.
-        blur = cv2.GaussianBlur(gray, (0, 0), 1.2)
-        sharp = cv2.addWeighted(gray, 1.7, blur, -0.7, 0)
-        candidates.append(sharp)
-
-    # Thử ảnh gốc trước.
-    for candidate in candidates:
-        data = decode_once(detector, candidate)
-        if data:
-            return data
-
-    # Thử xoay ảnh trong trường hợp ảnh bị xoay.
-    for angle in (90, 180, 270):
-        if angle == 90:
-            rotated = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-        elif angle == 180:
-            rotated = cv2.rotate(image, cv2.ROTATE_180)
-        else:
-            rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-        data = decode_once(detector, rotated)
-        if data:
-            return data
-
-        gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
-        data = decode_once(detector, gray)
-        if data:
-            return data
-
-    return None
+    return img
 
 
-def create_excel(rows, failed_files):
-    wb = Workbook()
-
-    ws = wb.active
-    ws.title = "Du lieu QR"
-
-    headers = [
-        "STT",
-        "Ten anh",
-        "So CCCD",
-        "Ho va ten",
-        "Ngay sinh",
-        "Gioi tinh",
-        "Dia chi",
-        "Ngay cap",
-        "QR_Goc",
-        "Trang thai"
-    ]
-    ws.append(headers)
-
-    for i, row in enumerate(rows, start=1):
-        ws.append([
-            i,
-            row["Ten anh"],
-            row["So CCCD"],
-            row["Ho va ten"],
-            row["Ngay sinh"],
-            row["Gioi tinh"],
-            row["Dia chi"],
-            row["Ngay cap"],
-            row["QR_Goc"],
-            row["Trang thai"]
-        ])
-
-    # Sheet ảnh lỗi.
-    ws2 = wb.create_sheet("Anh khong doc duoc")
-    ws2.append(["STT", "Ten anh", "Ly do", "Duong dan anh da copy"])
-
-    for i, item in enumerate(failed_files, start=1):
-        ws2.append([
-            i,
-            item["Ten anh"],
-            item["Ly do"],
-            item["Duong dan"]
-        ])
-
-    # Định dạng.
-    for sheet in (ws, ws2):
-        for cell in sheet[1]:
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill("solid", fgColor="D9EAF7")
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        sheet.freeze_panes = "A2"
-
-        for column_cells in sheet.columns:
-            max_len = 0
-            column_letter = column_cells[0].column_letter
-            for cell in column_cells:
-                value = "" if cell.value is None else str(cell.value)
-                max_len = max(max_len, len(value))
-            sheet.column_dimensions[column_letter].width = min(max(max_len + 2, 12), 45)
-
-    # Cột địa chỉ / QR gốc cho rộng hơn.
-    ws.column_dimensions["G"].width = 45
-    ws.column_dimensions["I"].width = 70
-    ws2.column_dimensions["D"].width = 45
-
-    wb.save(OUTPUT_XLSX)
-
-
-def main():
-    INPUT_DIR.mkdir(exist_ok=True)
-    FAILED_DIR.mkdir(exist_ok=True)
-
-    image_files = sorted(
-        p for p in INPUT_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+def normalize_lighting(gray: np.ndarray) -> np.ndarray:
+    """
+    Cân bằng sáng + tăng tương phản cục bộ.
+    """
+    clahe = cv2.createCLAHE(
+        clipLimit=3.0,
+        tileGridSize=(8, 8)
     )
+    return clahe.apply(gray)
 
-    if not image_files:
-        print("=" * 60)
-        print("KHONG TIM THAY ANH")
-        print(f"Hay bo anh vao thu muc: {INPUT_DIR}")
-        print("=" * 60)
-        input("Nhan Enter de thoat...")
+
+# ------------------------------------------------------------
+# TẠO CROP NGHI NGỜ QR
+# ------------------------------------------------------------
+
+def add_candidate(candidates, name, img):
+    if img is None or img.size == 0:
         return
 
-    rows = []
-    failed_files = []
+    h, w = img.shape[:2]
 
-    print("=" * 60)
-    print("        CHUONG TRINH DOC QR CCCD")
-    print("=" * 60)
-    print(f"So anh can doc: {len(image_files)}")
-    print()
+    # Bỏ những ảnh quá nhỏ.
+    if h < 80 or w < 80:
+        return
 
-    for index, image_path in enumerate(image_files, start=1):
-        print(f"[{index}/{len(image_files)}] Dang doc: {image_path.name}")
+    candidates.append((name, img))
 
-        image = cv2.imread(str(image_path))
 
-        if image is None:
-            print("   -> KHONG MO DUOC ANH")
-            destination = FAILED_DIR / image_path.name
-            shutil.copy2(image_path, destination)
-            failed_files.append({
-                "Ten anh": image_path.name,
-                "Ly do": "Khong mo duoc anh",
-                "Duong dan": str(destination)
-            })
-            continue
+def crop_top_right_regions(img: np.ndarray, candidates):
+    """
+    CCCD mặt trước của Việt Nam thường có QR ở khu vực phía trên bên phải.
+    Đây là chiến lược quan trọng cho ảnh giống mẫu người dùng gửi.
+    """
+    h, w = img.shape[:2]
 
-        data = decode_qr_robust(image)
+    for i, (x1, y1, x2, y2) in enumerate(TOP_RIGHT_CROPS):
+        crop = img[
+            int(h * y1):int(h * y2),
+            int(w * x1):int(w * x2)
+        ]
+        add_candidate(candidates, f"top_right_{i+1}", crop)
+
+
+def crop_grid_regions(img: np.ndarray, candidates):
+    """
+    Chia ảnh thành các vùng chồng lấn để QR không bị bỏ sót
+    khi ảnh có bố cục khác.
+    """
+    h, w = img.shape[:2]
+
+    # Grid 3x3 với overlap.
+    xs = [(0.00, 0.55), (0.225, 0.775), (0.45, 1.00)]
+    ys = [(0.00, 0.55), (0.225, 0.775), (0.45, 1.00)]
+
+    index = 0
+    for y1, y2 in ys:
+        for x1, x2 in xs:
+            index += 1
+            crop = img[
+                int(h * y1):int(h * y2),
+                int(w * x1):int(w * x2)
+            ]
+            add_candidate(candidates, f"grid_{index}", crop)
+
+
+def find_qr_like_contours(img: np.ndarray, candidates):
+    """
+    Tìm vùng có cấu trúc QR bằng contour.
+    Không phụ thuộc tuyệt đối vào tọa độ.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Làm nổi vùng đen/trắng.
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    for threshold_type in [
+        cv2.THRESH_BINARY,
+        cv2.THRESH_BINARY_INV,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    ]:
+        try:
+            if threshold_type & cv2.THRESH_OTSU:
+                _, binary = cv2.threshold(
+                    gray, 0, 255, threshold_type
+                )
+            else:
+                _, binary = cv2.threshold(
+                    gray, 145, 255, threshold_type
+                )
+
+            contours, _ = cv2.findContours(
+                binary,
+                cv2.RETR_LIST,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            h, w = gray.shape
+
+            for idx, contour in enumerate(contours):
+                x, y, cw, ch = cv2.boundingRect(contour)
+
+                area = cw * ch
+                if area < (w * h * 0.002):
+                    continue
+                if area > (w * h * 0.35):
+                    continue
+
+                ratio = cw / float(ch)
+
+                # QR thường gần vuông.
+                if 0.55 <= ratio <= 1.8:
+                    pad_x = int(cw * 0.20)
+                    pad_y = int(ch * 0.20)
+
+                    x1 = max(0, x - pad_x)
+                    y1 = max(0, y - pad_y)
+                    x2 = min(w, x + cw + pad_x)
+                    y2 = min(h, y + ch + pad_y)
+
+                    crop = img[y1:y2, x1:x2]
+
+                    add_candidate(
+                        candidates,
+                        f"contour_{threshold_type}_{idx}",
+                        crop
+                    )
+
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------
+# TẠO CÁC PHIÊN BẢN XỬ LÝ ẢNH
+# ------------------------------------------------------------
+
+def preprocessing_variants(img: np.ndarray):
+    """
+    Một crop -> nhiều phiên bản:
+    - gốc
+    - grayscale
+    - CLAHE
+    - gamma sáng/tối
+    - denoise
+    - sharpen
+    - Otsu
+    - adaptive threshold
+    """
+    result = []
+
+    if img is None or img.size == 0:
+        return result
+
+    # Resize crop.
+    h, w = img.shape[:2]
+
+    # QR nhỏ -> phóng to mạnh.
+    longest = max(h, w)
+
+    if longest < 800:
+        scales = [3.0, 4.0, 5.0]
+    elif longest < 1500:
+        scales = [2.0, 3.0, 4.0]
+    else:
+        scales = [1.5, 2.0]
+
+    # BGR
+    result.append(("color", img))
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    result.append(("gray", gray))
+
+    # Gamma correction
+    def gamma_correct(source, gamma):
+        inv = 1.0 / gamma
+        table = np.array([
+            ((i / 255.0) ** inv) * 255
+            for i in np.arange(256)
+        ]).astype("uint8")
+        return cv2.LUT(source, table)
+
+    # 0.65 = làm sáng vùng tối
+    bright = gamma_correct(gray, 0.65)
+    result.append(("bright", bright))
+
+    # 1.5 = làm rõ vùng sáng/tương phản
+    dark = gamma_correct(gray, 1.5)
+    result.append(("dark", dark))
+
+    clahe = normalize_lighting(gray)
+    result.append(("clahe", clahe))
+
+    # Denoise nhẹ.
+    denoise = cv2.fastNlMeansDenoising(
+        clahe,
+        None,
+        7,
+        7,
+        21
+    )
+    result.append(("denoise", denoise))
+
+    # Sharpen.
+    blur = cv2.GaussianBlur(denoise, (0, 0), 2.0)
+    sharpen = cv2.addWeighted(
+        denoise,
+        2.0,
+        blur,
+        -1.0,
+        0
+    )
+    result.append(("sharpen", sharpen))
+
+    for scale in scales:
+        for name, source in list(result):
+            enlarged = cv2.resize(
+                source,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+            yield f"{name}_x{scale}", enlarged
+
+            # Otsu
+            if len(enlarged.shape) == 2:
+                _, otsu = cv2.threshold(
+                    enlarged,
+                    0,
+                    255,
+                    cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                )
+                yield f"{name}_otsu_x{scale}", otsu
+
+                # Inverse Otsu
+                _, otsu_inv = cv2.threshold(
+                    enlarged,
+                    0,
+                    255,
+                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                )
+                yield f"{name}_otsu_inv_x{scale}", otsu_inv
+
+                # Adaptive
+                adaptive = cv2.adaptiveThreshold(
+                    enlarged,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    31,
+                    5
+                )
+                yield f"{name}_adaptive_x{scale}", adaptive
+
+
+# ------------------------------------------------------------
+# XOAY ẢNH
+# ------------------------------------------------------------
+
+def rotated_images(img):
+    yield "0", img
+
+    yield "90", cv2.rotate(
+        img,
+        cv2.ROTATE_90_CLOCKWISE
+    )
+
+    yield "180", cv2.rotate(
+        img,
+        cv2.ROTATE_180
+    )
+
+    yield "270", cv2.rotate(
+        img,
+        cv2.ROTATE_90_COUNTERCLOCKWISE
+    )
+
+
+# ------------------------------------------------------------
+# ZXING
+# ------------------------------------------------------------
+
+def zxing_decode(img):
+    if zxingcpp is None:
+        return None
+
+    try:
+        results = zxingcpp.read_barcodes(
+            img,
+            formats=zxingcpp.BarcodeFormat.QRCode,
+            try_rotate=True,
+            try_downscale=True,
+        )
+
+        for result in results:
+            if result.text:
+                return result.text
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ------------------------------------------------------------
+# OPENCV QR
+# ------------------------------------------------------------
+
+def opencv_decode(img):
+    detector = cv2.QRCodeDetector()
+
+    try:
+        data, points, _ = detector.detectAndDecode(img)
 
         if data:
-            cccd, ho_ten, ngay_sinh, gioi_tinh, dia_chi, ngay_cap = parse_cccd_qr(data)
+            return data
 
-            rows.append({
-                "Ten anh": image_path.name,
-                "So CCCD": cccd,
-                "Ho va ten": ho_ten,
-                "Ngay sinh": ngay_sinh,
-                "Gioi tinh": gioi_tinh,
-                "Dia chi": dia_chi,
-                "Ngay cap": ngay_cap,
-                "QR_Goc": data,
-                "Trang thai": "Doc thanh cong"
-            })
+    except Exception:
+        pass
 
-            print(f"   -> OK: {cccd} | {ho_ten}")
+    # Multi QR
+    try:
+        result = detector.detectAndDecodeMulti(img)
+
+        if len(result) == 4:
+            ok, decoded_info, _, _ = result
+
+            if ok and decoded_info:
+                values = [
+                    x for x in decoded_info if x
+                ]
+
+                if values:
+                    return "\n".join(values)
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ------------------------------------------------------------
+# WECHAT QR - OPTIONAL
+# ------------------------------------------------------------
+
+def wechat_decode(img):
+    """
+    Dùng WeChatQRCode nếu opencv-contrib + model files có sẵn.
+
+    Đặt 4 file model cạnh qr_decoder.py:
+        detect.prototxt
+        detect.caffemodel
+        sr.prototxt
+        sr.caffemodel
+
+    Nếu chưa có model -> tự bỏ qua.
+    """
+    try:
+        if not hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+            return None
+
+        base = Path(__file__).resolve().parent
+
+        detector_model = base / "detect.prototxt"
+        detector_weights = base / "detect.caffemodel"
+        sr_model = base / "sr.prototxt"
+        sr_weights = base / "sr.caffemodel"
+
+        if not all([
+            detector_model.exists(),
+            detector_weights.exists(),
+            sr_model.exists(),
+            sr_weights.exists(),
+        ]):
+            return None
+
+        detector = cv2.wechat_qrcode_WeChatQRCode(
+            str(detector_model),
+            str(detector_weights),
+            str(sr_model),
+            str(sr_weights),
+        )
+
+        results, _ = detector.detectAndDecode(img)
+
+        if results:
+            values = [x for x in results if x]
+            if values:
+                return "\n".join(values)
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ------------------------------------------------------------
+# ĐÁNH GIÁ CANDIDATE
+# ------------------------------------------------------------
+
+def prepare_candidates(img):
+    candidates = []
+
+    # 1. Ảnh gốc
+    add_candidate(candidates, "full", img)
+
+    # 2. QR theo bố cục CCCD
+    crop_top_right_regions(img, candidates)
+
+    # 3. Grid
+    crop_grid_regions(img, candidates)
+
+    # 4. Tìm contour
+    find_qr_like_contours(img, candidates)
+
+    # Giới hạn để không chạy vô hạn.
+    return candidates[:MAX_CANDIDATES]
+
+
+# ------------------------------------------------------------
+# DEBUG
+# ------------------------------------------------------------
+
+def save_debug_images(candidates, image_path):
+    if not SAVE_DEBUG:
+        return
+
+    debug_dir = image_path.parent / "debug_qr"
+    debug_dir.mkdir(exist_ok=True)
+
+    # Chỉ lưu tối đa 20 candidate đầu.
+    for i, (name, img) in enumerate(candidates[:20]):
+        try:
+            safe_name = "".join(
+                c if c.isalnum() or c in "-_" else "_"
+                for c in name
+            )
+
+            output = debug_dir / f"{i:02d}_{safe_name}.jpg"
+
+            cv2.imwrite(str(output), img)
+
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------
+# DECODER CHÍNH
+# ------------------------------------------------------------
+
+def decode_image(img, image_path):
+    candidates = prepare_candidates(img)
+
+    save_debug_images(candidates, image_path)
+
+    print(f"CANDIDATES | {len(candidates)}")
+
+    attempts = 0
+
+    # --------------------------------------------------------
+    # PHASE 1:
+    # Ưu tiên vùng top-right vì ảnh CCCD mẫu có QR ở đó.
+    # --------------------------------------------------------
+
+    priority = []
+    normal = []
+
+    for item in candidates:
+        if item[0].startswith("top_right"):
+            priority.append(item)
         else:
-            print("   -> KHONG TIM THAY / KHONG DOC DUOC QR")
+            normal.append(item)
 
-            destination = FAILED_DIR / image_path.name
-            shutil.copy2(image_path, destination)
+    ordered = priority + normal
 
-            failed_files.append({
-                "Ten anh": image_path.name,
-                "Ly do": "Khong co QR hoac khong giai ma duoc QR",
-                "Duong dan": str(destination)
-            })
+    # --------------------------------------------------------
+    # Mỗi candidate -> nhiều preprocessing -> nhiều decoder
+    # --------------------------------------------------------
 
-    create_excel(rows, failed_files)
+    for candidate_name, candidate in ordered:
 
-    print()
+        # Thử WeChat trên crop màu trước.
+        data = wechat_decode(candidate)
+
+        if data:
+            return data, f"WeChat/{candidate_name}"
+
+        # Thử ZXing trực tiếp.
+        data = zxing_decode(candidate)
+
+        if data:
+            return data, f"ZXing/{candidate_name}"
+
+        # Thử OpenCV trực tiếp.
+        data = opencv_decode(candidate)
+
+        if data:
+            return data, f"OpenCV/{candidate_name}"
+
+        # Preprocessing
+        for prep_name, prepared in preprocessing_variants(candidate):
+
+            attempts += 1
+
+            # WeChat
+            data = wechat_decode(prepared)
+            if data:
+                return data, (
+                    f"WeChat/{candidate_name}/{prep_name}"
+                )
+
+            # ZXing
+            data = zxing_decode(prepared)
+            if data:
+                return data, (
+                    f"ZXing/{candidate_name}/{prep_name}"
+                )
+
+            # OpenCV
+            data = opencv_decode(prepared)
+            if data:
+                return data, (
+                    f"OpenCV/{candidate_name}/{prep_name}"
+                )
+
+            # Xoay các phiên bản quan trọng.
+            if prep_name.endswith("_x3.0") or prep_name.endswith("_x4.0"):
+                for angle, rotated in rotated_images(prepared):
+
+                    if angle == "0":
+                        continue
+
+                    data = zxing_decode(rotated)
+                    if data:
+                        return data, (
+                            f"ZXing/{candidate_name}/"
+                            f"{prep_name}/rotate_{angle}"
+                        )
+
+                    data = opencv_decode(rotated)
+                    if data:
+                        return data, (
+                            f"OpenCV/{candidate_name}/"
+                            f"{prep_name}/rotate_{angle}"
+                        )
+
+    return None, None
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+
+def main():
+
+    if len(sys.argv) != 2:
+        print(
+            'ERROR | Cú pháp: '
+            'py qr_decoder.py "duong_dan_anh"'
+        )
+        sys.exit(2)
+
+    image_path = Path(
+        sys.argv[1].strip('"')
+    )
+
+    if not image_path.exists():
+        print(
+            f"ERROR | Không tìm thấy file: "
+            f"{image_path}"
+        )
+        sys.exit(3)
+
+    if not image_path.is_file():
+        print(
+            f"ERROR | Đường dẫn không phải file: "
+            f"{image_path}"
+        )
+        sys.exit(4)
+
+    img = load_image(image_path)
+
+    if img is None:
+        print(
+            "ERROR | Không thể đọc ảnh hoặc "
+            "ảnh không hợp lệ"
+        )
+        sys.exit(5)
+
+    original_h, original_w = img.shape[:2]
+
+    img = resize_for_processing(img)
+
+    h, w = img.shape[:2]
+
     print("=" * 60)
-    print("HOAN TAT")
-    print(f"Doc thanh cong : {len(rows)} anh")
-    print(f"Anh loi        : {len(failed_files)} anh")
-    print(f"File Excel     : {OUTPUT_XLSX}")
-    print(f"Anh loi        : {FAILED_DIR}")
+    print("QR DECODER V3")
     print("=" * 60)
-    input("Nhan Enter de thoat...")
+    print(f"IMAGE     | {image_path}")
+    print(
+        f"SIZE      | {original_w}x{original_h}"
+    )
+    print(
+        f"PROCESS   | {w}x{h}"
+    )
+
+    if zxingcpp is not None:
+        print("ZXING     | AVAILABLE")
+    else:
+        print(
+            "ZXING     | NOT INSTALLED "
+            "(py -m pip install zxing-cpp)"
+        )
+
+    if hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+        print("WECHAT    | OPENCV CONTRIB AVAILABLE")
+    else:
+        print("WECHAT    | OPTIONAL / NOT AVAILABLE")
+
+    print("STATUS    | SCANNING")
+    print("=" * 60)
+
+    data, method = decode_image(
+        img,
+        image_path
+    )
+
+    if data:
+        print("=" * 60)
+        print("STATUS    | SUCCESS")
+        print(f"METHOD    | {method}")
+        print("QR_DATA   | " + data)
+        print("=" * 60)
+
+        sys.exit(0)
+
+    print("=" * 60)
+    print("STATUS    | NOT_FOUND")
+    print(
+        "MESSAGE   | Không tìm thấy hoặc không "
+        "giải mã được QR trong ảnh"
+    )
+
+    if SAVE_DEBUG:
+        print(
+            f"DEBUG     | {image_path.parent / 'debug_qr'}"
+        )
+
+    print("=" * 60)
+
+    sys.exit(1)
 
 
 if __name__ == "__main__":
+    
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     main()

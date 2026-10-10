@@ -148,36 +148,30 @@ def convert_cccd_address(address: str, mapping_entries):
     return new_address, new_code, "Đã chuyển đổi"
 
 
-def parse_cccd_qr(data: str):
+def parse_cccd_qr(data: str) -> tuple[str, str, str, str, str, str, str]:
     """
     QR CCCD thường có dạng:
-    CCCD||Họ tên|Ngày sinh|Giới tính|Địa chỉ|Ngày cấp
+    CCCD|CMND cũ|Họ tên|Ngày sinh|Giới tính|Địa chỉ|Ngày cấp
 
-    Trả về 6 trường chính.
+    QR đời cũ có thể không có trường CMND cũ.
     Nếu định dạng khác, vẫn giữ toàn bộ dữ liệu ở cột QR_Goc.
     """
-    data = data.strip().replace("\x00", "")
-
     parts = data.split("|")
 
-    # Một số QR CCCD có || sau số CCCD.
-    if len(parts) >= 7 and parts[1] == "":
-        cccd = parts[0]
-        ho_ten = parts[2]
-        ngay_sinh = parts[3]
-        gioi_tinh = parts[4]
-        dia_chi = parts[5]
-        ngay_cap = parts[6]
-        return cccd, ho_ten, ngay_sinh, gioi_tinh, dia_chi, ngay_cap
-
-    # Trường hợp dữ liệu dùng đúng 6 phần.
-    if len(parts) >= 6:
+    if len(parts) >= 7:
         return (
-            parts[0], parts[1], parts[2],
-            parts[3], parts[4], parts[5]
+            parts[0],
+            parts[1],
+            parts[2],
+            parts[3],
+            parts[4],
+            parts[5],
+            parts[6],
         )
+    if len(parts) == 6:
+        return parts[0], "", parts[1], parts[2], parts[3], parts[4], parts[5]
 
-    return "", "", "", "", "", ""
+    return "", "", "", "", "", "", ""
 
 
 def rename_scanned_image(image_path: Path, ho_ten: str) -> Path:
@@ -250,6 +244,27 @@ def move_failed_image(image_path: Path, failed_dir: Path) -> Path:
         counter += 1
 
     return Path(shutil.move(str(image_path), str(destination)))
+
+
+def record_failed_image(image_path: Path, reason: str, failed_files) -> None:
+    """Chuyển ảnh không đọc được và ghi nhận lỗi, kể cả khi không di chuyển được."""
+    try:
+        destination = move_failed_image(image_path, FAILED_DIR)
+    except OSError as exc:
+        print(f"   -> KHONG CHUYEN DUOC ANH LOI: {exc}")
+        failed_files.append({
+            "Ten anh": image_path.name,
+            "Ly do": f"{reason}; không di chuyển được: {exc}",
+            "Duong dan": str(image_path)
+        })
+        return
+
+    print(f"   -> Da chuyen anh loi: {destination.name}")
+    failed_files.append({
+        "Ten anh": destination.name,
+        "Ly do": reason,
+        "Duong dan": str(destination)
+    })
 
 
 def decode_once(detector, image):
@@ -372,8 +387,10 @@ DATA_HEADERS = [
         "Trang thai chuyen doi",
         "Ngay cap",
         "QR_Goc",
-        "Trang thai"
+        "Trang thai",
+        "So CMND cu"
 ]
+LEGACY_DATA_HEADERS = DATA_HEADERS[:-1]
 FAILED_HEADERS = ["STT", "Ten anh", "Ly do", "Duong dan anh da copy"]
 
 
@@ -392,7 +409,10 @@ def load_existing_cccds(output_path: Path):
             worksheet.iter_rows(min_row=1, max_row=1, values_only=True),
             (),
         )
-        if tuple(headers) != tuple(DATA_HEADERS):
+        if tuple(headers) not in (
+            tuple(DATA_HEADERS),
+            tuple(LEGACY_DATA_HEADERS),
+        ):
             raise ValueError(
                 "Cấu trúc sheet 'Du lieu QR' không khớp với chương trình; "
                 "không thể kiểm tra trùng an toàn"
@@ -417,7 +437,16 @@ def create_excel(rows, failed_files):
             raise ValueError("Excel hiện có thiếu sheet kết quả cần thiết")
         ws = wb["Du lieu QR"]
         ws2 = wb["Anh khong doc duoc"]
-        if tuple(cell.value for cell in ws[1]) != tuple(DATA_HEADERS):
+        existing_headers = tuple(cell.value for cell in ws[1])
+        if existing_headers == tuple(LEGACY_DATA_HEADERS):
+            qr_column = LEGACY_DATA_HEADERS.index("QR_Goc") + 1
+            cmnd_column = len(LEGACY_DATA_HEADERS) + 1
+            ws.cell(row=1, column=cmnd_column, value="So CMND cu")
+            for row_number in range(2, ws.max_row + 1):
+                qr_data = ws.cell(row=row_number, column=qr_column).value
+                old_cmnd = parse_cccd_qr(str(qr_data or ""))[1]
+                ws.cell(row=row_number, column=cmnd_column, value=old_cmnd)
+        elif existing_headers != tuple(DATA_HEADERS):
             wb.close()
             raise ValueError("Cấu trúc sheet 'Du lieu QR' không khớp")
         if tuple(cell.value for cell in ws2[1]) != tuple(FAILED_HEADERS):
@@ -445,7 +474,8 @@ def create_excel(rows, failed_files):
             row["Trang thai chuyen doi"],
             row["Ngay cap"],
             row["QR_Goc"],
-            row["Trang thai"]
+            row["Trang thai"],
+            row["So CMND cu"]
         ])
 
     for item in failed_files:
@@ -551,7 +581,7 @@ def main():
     rows = []
     failed_files = []
     duplicate_count = 0
-    pending_file_moves = []
+    pending_scanned_renames = []
 
     print("=" * 60)
     print("        CHUONG TRINH DOC QR CCCD")
@@ -566,19 +596,25 @@ def main():
 
         if image is None:
             print("   -> KHONG MO DUOC ANH")
-            destination = move_failed_image(image_path, FAILED_DIR)
-            pending_file_moves.append((destination, image_path))
-            failed_files.append({
-                "Ten anh": destination.name,
-                "Ly do": "Khong mo duoc anh",
-                "Duong dan": str(destination)
-            })
+            record_failed_image(
+                image_path,
+                "Không mở được ảnh",
+                failed_files,
+            )
             continue
 
         data = decode_qr_robust(image)
 
         if data:
-            cccd, ho_ten, ngay_sinh, gioi_tinh, dia_chi, ngay_cap = parse_cccd_qr(data)
+            (
+                cccd,
+                cmnd_cu,
+                ho_ten,
+                ngay_sinh,
+                gioi_tinh,
+                dia_chi,
+                ngay_cap,
+            ) = parse_cccd_qr(data)
             cccd_key = str(cccd or "").strip()
 
             if cccd_key and cccd_key in existing_cccds:
@@ -602,7 +638,9 @@ def main():
             try:
                 output_image_path = rename_scanned_image(image_path, ho_ten)
                 if output_image_path != image_path:
-                    pending_file_moves.append((output_image_path, image_path))
+                    pending_scanned_renames.append(
+                        (output_image_path, image_path)
+                    )
             except (OSError, ValueError) as exc:
                 print(f"   -> KHONG DANH DAU DUOC ANH DA QUET: {exc}")
             if not ho_ten:
@@ -614,6 +652,7 @@ def main():
             rows.append({
                 "Ten anh": output_image_path.name,
                 "So CCCD": cccd,
+                "So CMND cu": cmnd_cu,
                 "Ho va ten": ho_ten,
                 "Ngay sinh": ngay_sinh,
                 "Gioi tinh": gioi_tinh,
@@ -637,22 +676,23 @@ def main():
             )
         else:
             print("   -> KHONG TIM THAY / KHONG DOC DUOC QR")
-
-            destination = move_failed_image(image_path, FAILED_DIR)
-            pending_file_moves.append((destination, image_path))
-
-            failed_files.append({
-                "Ten anh": destination.name,
-                "Ly do": "Khong co QR hoac khong giai ma duoc QR",
-                "Duong dan": str(destination)
-            })
+            record_failed_image(
+                image_path,
+                "Không có QR hoặc không giải mã được QR",
+                failed_files,
+            )
 
     try:
         create_excel(rows, failed_files)
     except (OSError, ValueError, BadZipFile) as exc:
         print(f"KHONG THE CAP NHAT FILE EXCEL: {exc}")
         print("Hay dong file Excel neu dang mo, sau do chay lai.")
-        for moved_path, original_path in reversed(pending_file_moves):
+        if failed_files:
+            print(
+                "Anh khong doc duoc QR van duoc giu trong thu muc anh loi, "
+                "nhung chua duoc ghi vao Excel."
+            )
+        for moved_path, original_path in reversed(pending_scanned_renames):
             try:
                 if moved_path.exists() and not original_path.exists():
                     moved_path.rename(original_path)
